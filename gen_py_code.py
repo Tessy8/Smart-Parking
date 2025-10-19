@@ -4,18 +4,21 @@ import pandas as pd # pip install pandas
 import os
 import json
 import random
+import numpy as np
+import matplotlib.pyplot as plt
 
 # Simulation clock
 simulation_time = {"day": 1, "hour": 0, "minute": 0}  # Starts on Day 1 (Monday) at 00:00
-time_increment = 30  # Minutes to advance per loop iteration
+time_increment = 1  # Minutes to advance per loop iteration
+bookings_count = 24*60/time_increment*7
 
 # Configuration for peak conditions based on each lot's specifics
 lot_conditions = {
     1: {"peak_days": list(range(1, 8)), "peak_hours": (8, 21), "Th_peak": 1.25, "Th_off": 1, "current_occupancy": 0, "average_occupancy": 3},
-    2: {"peak_days": list(range(1, 8)), "peak_hours": (18, 22), "Th_peak": 1.5, "Th_off": 1, "current_occupancy": 0, "average_occupancy": 5},
+    2: {"peak_days": list(range(1, 8)), "peak_hours": (18, 22), "Th_peak": 1.5, "Th_off": 1, "current_occupancy": 0, "average_occupancy": 3},
     3: {"peak_days": list(range(1, 6)), "peak_hours": (8, 17), "Th_peak": 1.5, "Th_off": 1, "current_occupancy": 0, "average_occupancy": 2},
     4: {"peak_days": [3], "peak_hours": (17, 22), "Th_peak": 1.5, "Th_off": 1, "current_occupancy": 0, "average_occupancy": 6},
-    5: {"peak_days": [6, 7], "peak_hours": (10, 21), "Th_peak": 1.5, "Th_off": 1, "current_occupancy": 9, "average_occupancy": 10}
+    5: {"peak_days": [6, 7], "peak_hours": (10, 21), "Th_peak": 1.5, "Th_off": 1, "current_occupancy": 0, "average_occupancy": 4}
 }
 
 # Constants for the model
@@ -37,9 +40,203 @@ bookings_file = 'gen_bookings_with_price.csv'
 bookings_only_file = 'gen_bookings.csv'
 lot_occupancy_file = 'gen_lot_occupancy.csv' 
 simulation_time_file = "gen_simulation_time.json"
+requests_file = 'gen_requests.csv'   # log of accepted/denied booking requests
+metrics_overview_file = 'gen_metrics_overview.csv'
+availability_by_lot_file = 'gen_availability_by_lot.csv'
+plots_dir = 'plots'
 simulated_occupancy = 0
 
 # Initialize DataFrames
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def log_request(day, lot_id, start_hour, end_hour, status):
+    """Append a single booking request outcome to CSV."""
+    row = pd.DataFrame([{
+        "Day": day,
+        "Lot ID": lot_id,
+        "Start Hour": start_hour,
+        "End Hour": end_hour,
+        "Status": status  # "accepted" or "denied" (only initial bookings)
+    }])
+    if os.path.exists(requests_file):
+        row.to_csv(requests_file, mode='a', header=False, index=False)
+    else:
+        row.to_csv(requests_file, index=False)
+
+def build_occupancy_timeline(bookings_df, lot_conditions):
+    """
+    Rebuild per-hour occupancy from bookings (RESERVED==1).
+    Returns a DataFrame with columns: Lot ID, Day, Hour, Occupancy, Capacity.
+    """
+    records = []
+    for lot_id, cfg in lot_conditions.items():
+        cap = int(cfg["average_occupancy"])
+        for day in range(1, 8):
+            for hour in range(0, 24):
+                # count regular reserved hours
+                mask = (
+                    (bookings_df["Reserved"] == 1) &
+                    (bookings_df["Lot ID"] == lot_id) &
+                    (bookings_df["Day"] == day) &
+                    (bookings_df["Start Hour"] <= hour) &
+                    (bookings_df["End Hour"] > hour)
+                )
+                occ = int(mask.sum())
+
+                # count overstay hours (if any)
+                mask_over = (
+                    (bookings_df["Reserved"] == 1) &
+                    (bookings_df["Lot ID"] == lot_id) &
+                    (bookings_df["Day"] == day) &
+                    (~bookings_df["Overstay Start Hour"].isna()) &
+                    (~bookings_df["Overstay End Hour"].isna()) &
+                    (bookings_df["Overstay Start Hour"] <= hour) &
+                    (bookings_df["Overstay End Hour"] > hour)
+                )
+                occ += int(mask_over.sum())
+
+                records.append({
+                    "Lot ID": lot_id,
+                    "Day": day,
+                    "Hour": hour,
+                    "Occupancy": occ,
+                    "Capacity": cap
+                })
+    return pd.DataFrame.from_records(records)
+
+def med_iqr(series):
+    """Return (median, IQR) where IQR = Q3 - Q1."""
+    q1 = series.quantile(0.25)
+    med = series.quantile(0.5)
+    q3 = series.quantile(0.75)
+    return float(med), float(q3 - q1)
+
+def summarize_metrics(bookings_df, lot_conditions):
+    """
+    Compute tables & plots:
+    - Revenue (total, per-hour, per-booking) for models 1–4
+    - Availability A_l and system-wide A
+    - Denied-booking rate from requests_file
+    - Median [IQR] distributions for prices, discounts, overstay penalties
+    """
+    ensure_dir(plots_dir)
+
+    # Use only completed/used bookings for revenue (Reserved==1)
+    acc = bookings_df[bookings_df["Reserved"] == 1].copy()
+    if acc.empty:
+        print("No accepted (Reserved==1) bookings to summarize.")
+        return
+
+    # Hours per booking = booked hours + overstay hours
+    acc["Hours"] = (acc["End Hour"] - acc["Start Hour"]).astype(float) + acc["Overstay Hours"].fillna(0).astype(float)
+    total_hours = acc["Hours"].sum()
+
+    # Revenue per model
+    models = [
+        ("Model1", "Pfinal_Model1"),
+        ("Model2", "Pfinal_Model2"),
+        ("Model3", "Pfinal_Model3"),
+        ("Model4", "Pfinal_Model4"),
+    ]
+
+    overview_rows = []
+    price_series_by_model = {}
+
+    for label, col in models:
+        s = acc[col].astype(float)
+        price_series_by_model[label] = s
+        total_rev = float(s.sum())
+        rev_per_hour = float(total_rev / total_hours) if total_hours > 0 else np.nan
+        rev_per_booking = float(s.mean()) if len(s) > 0 else np.nan
+        med, iqr = med_iqr(s)
+        overview_rows.append({
+            "Model": label,
+            "TotalRevenue": round(total_rev, 2),
+            "RevenuePerHour": round(rev_per_hour, 4),
+            "RevenuePerBooking": round(rev_per_booking, 2),
+            "MedianPrice": round(med, 2),
+            "IQRPrice": round(iqr, 2)
+        })
+
+    overview_df = pd.DataFrame(overview_rows)
+    overview_df.to_csv(metrics_overview_file, index=False)
+    print(f"Saved revenue overview -> {metrics_overview_file}")
+
+    # Availability from reconstructed occupancy
+    occ_df = build_occupancy_timeline(acc, lot_conditions)
+    occ_df["has_space"] = (occ_df["Occupancy"] < occ_df["Capacity"]).astype(int)
+    A_by_lot = occ_df.groupby("Lot ID")["has_space"].mean().reset_index().rename(columns={"has_space": "A_l"})
+    A_by_lot["A_l"] = A_by_lot["A_l"].round(4)
+    A_overall = float(A_by_lot["A_l"].mean()) if not A_by_lot.empty else np.nan
+
+    # Save availability table (include overall A in a last row)
+    overall_row = {"Lot ID": "SYSTEM", "A_l": round(A_overall, 4)}
+    pd.concat([A_by_lot, pd.DataFrame([overall_row])], ignore_index=True)\
+      .to_csv(availability_by_lot_file, index=False)
+    print(f"Saved availability by lot -> {availability_by_lot_file}")
+
+    # Denied booking rate from request log (accepted/denied for initial bookings)
+    denied_rate = np.nan
+    if os.path.exists(requests_file):
+        req = pd.read_csv(requests_file)
+        if not req.empty:
+            total_req = len(req)
+            denied = int((req["Status"] == "denied").sum())
+            denied_rate = denied / total_req if total_req > 0 else np.nan
+            print(f"Denied-booking rate: {denied_rate:.4f}  ({denied}/{total_req})")
+    else:
+        print("No request log found; denied-booking rate not computed.")
+
+    # --------- Plots ---------
+    # Boxplot of final prices by model
+    plt.figure()
+    data = [price_series_by_model[m] for m, _ in models]
+    plt.boxplot(data, tick_labels=[m for m, _ in models], showfliers=False)
+    plt.title("Final Prices by Model (boxplot)")
+    plt.ylabel("Price")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "boxplot_prices_by_model.png"))
+    plt.close()
+
+    # Boxplot of effective discounts (percent)
+    discounts = acc["Dloyalty_final"].clip(upper=Dmax).astype(float)
+    plt.figure()
+    plt.boxplot([discounts], tick_labels=["Effective Discount (%)"], showfliers=False)
+    plt.title("Effective Discounts (Median [IQR])")
+    plt.ylabel("Percent")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "boxplot_discounts.png"))
+    plt.close()
+
+    # Boxplot of overstay penalties (only non-zero)
+    overstay_pen = acc["Poverstay_total"].fillna(0).astype(float)
+    nonzero_pen = overstay_pen[overstay_pen > 0]
+    plt.figure()
+    if len(nonzero_pen) > 0:
+        plt.boxplot([nonzero_pen], tick_labels=["Overstay Penalty"], showfliers=False)
+    else:
+        plt.boxplot([overstay_pen], tick_labels=["Overstay Penalty"], showfliers=False)
+    plt.title("Overstay Penalties (boxplot)")
+    plt.ylabel("Currency")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "boxplot_overstay_penalties.png"))
+    plt.close()
+
+    # Bar of A_l and overall A
+    plt.figure()
+    plt.bar(A_by_lot["Lot ID"].astype(str), A_by_lot["A_l"])
+    plt.axhline(A_overall, linestyle='--')
+    plt.title("Availability per Lot (A_l) with System-wide A")
+    plt.xlabel("Lot")
+    plt.ylabel("Share of hours with ≥1 free space")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "availability_per_lot.png"))
+    plt.close()
+
+    print(f"Saved plots to ./{plots_dir}")
+    print("Summary complete.")
+
 def load_data():
     if os.path.exists(users_file):
         users_df = pd.read_csv(users_file)
@@ -70,10 +267,10 @@ def load_data():
         "Bcurrent", "O", "Dloyalty_final", "Overstay Start Hour", "Overstay End Hour", "Overstay Hours", "Poverstay_total", "Pfinal_Model1", "Pfinal_Model2",
         "Pfinal_Model3", "Pfinal_Model4", "decremented", "decremented_overstay"
         ])
-        bookings_df['decremented'] = False
-        bookings_df['decremented_overstay'] = False
-        bookings_df['decremented'] = bookings_df['decremented'].astype(bool)
-        bookings_df['decremented_overstay'] = bookings_df['decremented_overstay'].astype(bool)
+        for col in ["decremented", "decremented_overstay"]:
+            if col not in bookings_df.columns:
+                bookings_df[col] = False
+            bookings_df[col] = bookings_df[col].fillna(False).astype(bool)
     if os.path.exists(bookings_only_file):
         bookings_only_df = pd.read_csv(bookings_only_file)
     else:
@@ -173,10 +370,9 @@ def calculate_th(lot_id, day_of_week, hour):
     return 1
 
 def calculate_dh(current_occupancy, average_occupancy):
-    if current_occupancy > 0.7 * average_occupancy:
-        return current_occupancy / average_occupancy 
-    else:
-        return 0.7
+    avg = max(int(average_occupancy), 1)  # treat avg as capacity; avoid /0
+    ratio = current_occupancy / avg
+    return max(0.7, ratio)
 
 def calculate_ph(Pbase, Dh, Th, W):
     return Pbase * Dh * Th * W
@@ -193,15 +389,22 @@ def calculate_loyalty_discount(F, Ttotal, start_hour, end_hour, M, total_reserva
     else:
         return Dmax, gamma
 
-def calculate_overstay_penalty(lot_id, day_of_week, Pbase, Dh, Th, W, overstay_start_hour, overstay_end_hour, num_overstays, total_reservations):
+def calculate_overstay_penalty(lot_id, day_of_week, Pbase, Dh, Th, W,
+                               overstay_start_hour, overstay_end_hour,
+                               num_overstays, total_reservations):
     lambda_factor = (1 + num_overstays / total_reservations) if total_reservations > 0 else 1
     Poverstay_total = 0
-    for hour in range(overstay_start_hour, overstay_end_hour):
+    if overstay_start_hour is None or overstay_end_hour is None:
+        return 0
+
+    start = int(overstay_start_hour)
+    end = min(int(overstay_end_hour), 24)
+    for hour in range(start, end):
         Th_overstay = calculate_th(lot_id, day_of_week, hour)
         Ph_extra = calculate_ph(Pbase, Dh, Th_overstay, W)
         Poverstay_total += 0.7 * Ph_extra
-    Poverstay_total *= lambda_factor
-    return Poverstay_total
+
+    return lambda_factor * Poverstay_total
 
 def get_available_lots(day, lot_occupancy_df):
     available_lots = []
@@ -273,93 +476,76 @@ def check_availability(bookings_df, lot_id, day):
 def decrement_occupancy(lot_id, simulation_time_day, simulation_time_hour, users_df, bookings_df, lot_occupancy_df):
     current_day = simulation_time_day
     current_hour = simulation_time_hour
-    global simulated_occupancy
 
-    # Get all bookings for the given day where conditions for decrement are met
-    expired_bookings = bookings_df[(bookings_df["Day"] == current_day) & (bookings_df["Lot ID"] == lot_id) &
+    # bookings that need an occupancy decrement (end passed; not yet flagged)
+    expired_bookings = bookings_df[
+        (bookings_df["Day"] == current_day) &
+        (bookings_df["Lot ID"] == lot_id) &
         (
-            # Condition 1: No overstay, end hour has passed, and not decremented
-            ((bookings_df["Overstay End Hour"].isna()) & (bookings_df["End Hour"] <= current_hour) & (bookings_df["decremented"] != True)) |
-            # Condition 2: Overstay exists, overstay end hour has passed, and not decremented
-            ((~bookings_df["Overstay End Hour"].isna()) & (bookings_df["Overstay End Hour"] <= current_hour) & (bookings_df["decremented_overstay"] != True))
+            # no overstay: end passed and not decremented
+            (bookings_df["Overstay End Hour"].isna() & (bookings_df["End Hour"] <= current_hour) & (~bookings_df["decremented"].fillna(False))) |
+            # with overstay: overstay end passed and not decremented_overstay
+            (~bookings_df["Overstay End Hour"].isna() & (bookings_df["Overstay End Hour"] <= current_hour) & (~bookings_df["decremented_overstay"].fillna(False)))
         )
     ]
 
-    # Get the current occupancy for the specific lot and day
-    current_occupancy = lot_occupancy_df.loc[(lot_occupancy_df["Lot ID"] == lot_id) & (lot_occupancy_df["Day"] == current_day), "Current Occupancy"].values[0]
-    simulated_occupancy = current_occupancy
+    lot_mask = (lot_occupancy_df["Lot ID"] == lot_id) & (lot_occupancy_df["Day"] == current_day)
 
-    # Process expired bookings (based on above conditions)
-    for index, booking in expired_bookings.iterrows():
-        if current_occupancy > 0 and current_hour == simulation_time["hour"] and current_day == simulation_time["day"]:
-            # Decrease occupancy
-            lot_occupancy_df.loc[(lot_occupancy_df["Lot ID"] == lot_id) & (lot_occupancy_df["Day"] == current_day), "Current Occupancy"] -= 1
-            # Update decrement flag based on the type of expiration
-            if pd.isna(booking["Overstay End Hour"]) and booking["End Hour"] <= current_hour and pd.isna(booking["decremented"]):
-                bookings_df.loc[bookings_df["Booking Number"] == booking["Booking Number"], "decremented"] = True
-                bookings_df.loc[bookings_df["Booking Number"] == booking["Booking Number"], "decremented_overstay"] = True
-            elif not pd.isna(booking["Overstay End Hour"]) and booking["Overstay End Hour"] <= current_hour and pd.isna(booking["decremented"]):
-                bookings_df.loc[bookings_df["Booking Number"] == booking["Booking Number"], "decremented_overstay"] = True
-                bookings_df.loc[bookings_df["Booking Number"] == booking["Booking Number"], "decremented"] = True
-            print(f'Occupancy decremented for Lot {lot_id} on day {current_day}. '
-              f'Current occupancy: {lot_occupancy_df.loc[(lot_occupancy_df["Lot ID"] == lot_id)(lot_occupancy_df["Day"] == current_day), "Current Occupancy"].values[0]}')
+    for _, booking in expired_bookings.iterrows():
+        # decrement occupancy and clamp at 0
+        lot_occupancy_df.loc[lot_mask, "Current Occupancy"] = (
+            lot_occupancy_df.loc[lot_mask, "Current Occupancy"] - 1
+        ).clip(lower=0)
+
+        # set the right boolean flag (don't use isna on booleans)
+        if pd.isna(booking["Overstay End Hour"]):
+            bookings_df.loc[bookings_df["Booking Number"] == booking["Booking Number"], "decremented"] = True
         else:
-            if simulated_occupancy != 0:
-                simulated_occupancy -= 1
+            bookings_df.loc[bookings_df["Booking Number"] == booking["Booking Number"], "decremented_overstay"] = True
 
-    if current_hour == simulation_time["hour"]:
-        save_data(users_df, bookings_df, lot_occupancy_df)
+    if not lot_occupancy_df.loc[lot_mask, "Current Occupancy"].empty:
+        print(
+            f'Occupancy decremented for Lot {lot_id} on day {current_day}. '
+            f'Current occupancy: {int(lot_occupancy_df.loc[lot_mask, "Current Occupancy"].values[0])}'
+        )
+
+    save_data(users_df, bookings_df, lot_occupancy_df)
 
 def advance_time(users_df, bookings_df, lot_occupancy_df):
-    """Advance the simulation clock by the configured time increment."""
     global simulation_time
     simulation_time["minute"] += time_increment
 
-    # Handle minute rollover
     if simulation_time["minute"] >= 60:
         simulation_time["minute"] -= 60
         simulation_time["hour"] += 1
 
-    # Handle hour rollover
     if simulation_time["hour"] >= 24:
         simulation_time["hour"] -= 24
-        simulation_time["day"] += 1
+        simulation_time["day"] = 1 if simulation_time["day"] == 7 else simulation_time["day"] + 1
 
-        # Handle day rollover
-        if simulation_time["day"] > 7:  # Wrap around to Day 1 after Day 7
-            simulation_time["day"] = 1
-    # Automatically decrement occupancy for bookings that have ended
-    for lot_id in lot_conditions.keys():  # Iterate over lot IDs from lot_conditions
-        for day in range(1, 8):
-            decrement_occupancy(lot_id, day, simulation_time["hour"], users_df, bookings_df, lot_occupancy_df)
+    # decrement only for the current simulated day
+    for lot_id in lot_conditions.keys():
+        decrement_occupancy(lot_id, simulation_time["day"], simulation_time["hour"], users_df, bookings_df, lot_occupancy_df)
 
 def get_simulation_time():
     # """Retrieve the current simulation time as a formatted string."""
     return f"Day {simulation_time['day']} (Hour {simulation_time['hour']:02}:{simulation_time['minute']:02})"
 
 def will_lot_be_available(bookings_df, users_df, lot_occupancy_df, lot_id, day, start_hour, end_hour):
-    decrement_occupancy(lot_id, day, start_hour, users_df, bookings_df, lot_occupancy_df)
-    # Get all bookings for the given lot and day
+    # seed from recorded occupancy for that lot/day
+    lot_day = lot_occupancy_df[(lot_occupancy_df["Lot ID"] == lot_id) & (lot_occupancy_df["Day"] == day)]
+    current = int(lot_day["Current Occupancy"].iloc[0]) if not lot_day.empty else lot_conditions[lot_id]["current_occupancy"]
+    capacity = int(lot_conditions[lot_id]["average_occupancy"])  # you defined avg == capacity
+
+    # consider overlapping RESERVED bookings on that day
     lot_day_bookings = bookings_df[(bookings_df["Lot ID"] == lot_id) & (bookings_df["Day"] == day)]
-    
-    # Initialize current occupancy
-    global simulated_occupancy
-    max_occupancy = lot_conditions[lot_id]["average_occupancy"]
-    
-    for _, booking in lot_day_bookings.iterrows():
-        # Regular booking time
-        booking_start = booking["Start Hour"]
-        booking_end = booking["End Hour"]
-        
-        # Check if the requested time overlaps with the regular booking
-        if (not (end_hour <= booking_start or start_hour >= booking_end)) and booking["Reserved"] == 1:  # Overlap condition
-            simulated_occupancy += 1
-        
-        # If at any point, the occupancy exceeds the maximum, return False
-        if simulated_occupancy > max_occupancy:
-            return False
-    
-    return True  # Booking is feasible
+    for _, b in lot_day_bookings.iterrows():
+        overlaps = not (end_hour <= b["Start Hour"] or start_hour >= b["End Hour"])
+        if overlaps and b.get("Reserved", 0) == 1:
+            current += 1
+            if current > capacity:
+                return False
+    return True
 
 def add_booking(users_df, bookings_df, lot_occupancy_df):
     current_day = simulation_time["day"]
@@ -436,8 +622,11 @@ def add_booking(users_df, bookings_df, lot_occupancy_df):
                     print(f"Available lots for day {day_of_week}:", ', '.join(map(str, available_lots)))
                 else:
                     print(f"No available lots for day {day_of_week}.")
-                return users_df, bookings_df, lot_occupancy_df  # Exit without proceeding if lot is full
-            M = users_df.loc[users_df["User ID"] == user_id, "M"].values[0]
+                log_request(day_of_week, lot_id, start_hour, end_hour, "denied")   # <-- ADD THIS
+                return users_df, bookings_df, lot_occupancy_df
+            else:
+                log_request(day_of_week, lot_id, start_hour, end_hour, "accepted") # <-- ADD THIS
+                M = users_df.loc[users_df["User ID"] == user_id, "M"].values[0]
     except ValueError:
         print("Invalid input for missed reservations.")
         return users_df, bookings_df, lot_occupancy_df
@@ -476,6 +665,7 @@ def add_booking(users_df, bookings_df, lot_occupancy_df):
                 return users_df, bookings_df, lot_occupancy_df
             if not will_lot_be_available(bookings_df, users_df, lot_occupancy_df, lot_id, day_of_week, overstay_start_hour, overstay_end_hour):
                 print("Overstay denied. The lot is full.")
+                log_request(day_of_week, lot_id, overstay_start_hour, overstay_end_hour, "overstay_denied")
                 O = 0
             else:
                 O = 1
@@ -489,8 +679,8 @@ def add_booking(users_df, bookings_df, lot_occupancy_df):
         return users_df, bookings_df, lot_occupancy_df
     
     if current_occupancy < average_occupancy:
-        lot_occupancy_df.loc[(lot_occupancy_df["Lot ID"] == lot_id) & (lot_occupancy_df["Day"] == day_of_week), "Current Occupancy"] += 1  # Increment occupancy
-    
+        lot_occupancy_df.loc[(lot_occupancy_df["Lot ID"] == lot_id) & (lot_occupancy_df["Day"] == day_of_week),"Current Occupancy"] += 1
+            
     # Retrieve user cumulative data
     user_row = users_df.loc[users_df["User ID"] == user_id].iloc[0]
     F = user_row["F"]
@@ -597,7 +787,10 @@ def add_booking(users_df, bookings_df, lot_occupancy_df):
         "Pfinal_Model1": Pfinal_model1,
         "Pfinal_Model2": Pfinal_model2,
         "Pfinal_Model3": Pfinal_model3,
-        "Pfinal_Model4": Pfinal_model4
+        "Pfinal_Model4": Pfinal_model4,
+        "decremented": False,
+        "decremented_overstay": False
+
     }
     
     # Create booking entry as a DataFrame
@@ -605,6 +798,8 @@ def add_booking(users_df, bookings_df, lot_occupancy_df):
 
     # Concatenate with bookings_df, ensuring consistency in data types
     bookings_df = pd.concat([bookings_df, booking_entry_df], ignore_index=True)
+    bookings_df["decremented"] = bookings_df["decremented"].fillna(False).astype(bool)
+    bookings_df["decremented_overstay"] = bookings_df["decremented_overstay"].fillna(False).astype(bool)
         
     # Save data to CSV
     save_data(users_df, bookings_df, lot_occupancy_df)
@@ -626,11 +821,12 @@ def main():
         choice = input("Enter your choice (0-1): ").strip()
         
         if choice == '0':
-            for i in range(100):
+            for i in range(int(bookings_count)):
                 users_df, bookings_df, lot_occupancy_df = add_booking(users_df, bookings_df, lot_occupancy_df)
                 # Advance the simulation time automatically at the end of the loop
                 advance_time(users_df, bookings_df, lot_occupancy_df)
-                save_simulation_time() 
+                save_simulation_time()
+            summarize_metrics(bookings_df, lot_conditions)
         if choice == '1':
             break
         else:
